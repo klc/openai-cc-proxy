@@ -3,10 +3,10 @@
 /**
  * Anthropic -> OpenCode Go API Proxy
  *
- * Claude Code'un Anthropic Messages API isteklerini OpenCode Go'nun
- * OpenAI-compatible chat/completions API'sine cevirir.
+ * Claude Code sends Anthropic Messages API requests; this proxy converts them
+ * to OpenCode Go's OpenAI-compatible chat/completions API.
  *
- * Claude Code:
+ * Claude Code usage:
  *   export ANTHROPIC_BASE_URL="http://localhost:<PORT>"
  *   export ANTHROPIC_API_KEY="<opencode-go-api-key>"
  *   export ANTHROPIC_MODEL="kimi-k2.6"
@@ -20,7 +20,7 @@ const path = require("path");
 
 function loadEnv(filePath = path.join(__dirname, ".env")) {
   if (!fs.existsSync(filePath)) {
-    console.warn(`[.env] ${filePath} bulunamadi, sadece ortam degiskenleri kullanilacak.`);
+    console.warn(`[.env] ${filePath} not found, using environment variables only.`);
     return;
   }
 
@@ -40,7 +40,7 @@ function loadEnv(filePath = path.join(__dirname, ".env")) {
       process.env[key] = val;
     }
   }
-  console.log(`[.env] ${filePath} yuklendi.`);
+  console.log(`[.env] Loaded ${filePath}`);
 }
 
 loadEnv();
@@ -53,21 +53,14 @@ const SONNET_MODEL = process.env.OPENCODE_SONNET_MODEL || process.env.OPENCODE_D
 const HAIKU_MODEL = process.env.OPENCODE_HAIKU_MODEL || process.env.OPENCODE_SMALL_FAST_MODEL || "deepseek-v4-flash";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 600000);
 
+// [FIX #9] Read allowed origins from env; default to localhost-only for security.
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
+  : null; // null means localhost-only (wildcard disabled by default)
+
 const upstreamUrl = new URL(OPENCODE_API_URL);
 const UPSTREAM_BASE = upstreamUrl.pathname.replace(/\/$/, "");
 const UPSTREAM_CLIENT = upstreamUrl.protocol === "http:" ? http : https;
-
-const MODEL_MAP = {
-  "claude-opus-4-5": OPUS_MODEL,
-  "claude-opus-4-1-20250805": OPUS_MODEL,
-  "claude-sonnet-4-5": SONNET_MODEL,
-  "claude-sonnet-4-6": SONNET_MODEL,
-  "claude-3-5-sonnet-latest": SONNET_MODEL,
-  "claude-3-7-sonnet-latest": SONNET_MODEL,
-  "claude-sonnet-4-5-20250929": SONNET_MODEL,
-  "claude-haiku-4-5-20251001": HAIKU_MODEL,
-  "claude-3-5-haiku-latest": HAIKU_MODEL,
-};
 
 const LOCAL_MODELS = [
   "glm-5.1",
@@ -84,18 +77,18 @@ const LOCAL_MODELS = [
   "qwen3.5-plus",
 ];
 
+// [FIX #5] Removed static MODEL_MAP — family-based matching below is sufficient
+// and avoids stale hardcoded version strings.
 function mapModel(model) {
   if (!model) return SONNET_MODEL;
   if (model.startsWith("opencode-go/")) return model.slice("opencode-go/".length);
-
-  const mappedModel = MODEL_MAP[model];
-  if (mappedModel) return mappedModel;
 
   const normalized = model.toLowerCase();
   if (normalized.includes("opus")) return OPUS_MODEL;
   if (normalized.includes("sonnet")) return SONNET_MODEL;
   if (normalized.includes("haiku")) return HAIKU_MODEL;
 
+  // Unknown model passed through as-is (e.g. a direct OpenCode Go model name)
   return model;
 }
 
@@ -235,6 +228,8 @@ function convertAnthropicMessagesToOpenAI(messages = [], system) {
         } else if (block.type === "thinking") {
           thinkingBlocks.push(block.thinking || block.text || "");
         } else if (block.type === "redacted_thinking") {
+          // redacted_thinking is intentionally dropped — upstream providers do not
+          // support this Anthropic-specific block type.
           thinkingBlocks.push("[redacted thinking]");
         } else if (block.type === "tool_use") {
           toolCalls.push({
@@ -294,35 +289,47 @@ function convertAnthropicMessagesToOpenAI(messages = [], system) {
   return repairOpenAIToolMessageOrder(openaiMessages);
 }
 
+// [FIX #1] Rewritten to avoid mutating the input array.
+// Original used messages.splice() which caused side effects on the caller's array.
+// Now we work entirely on the output (repaired) array using index tracking.
 function repairOpenAIToolMessageOrder(messages) {
   const repaired = [];
+  // Track which indices have already been placed so we can skip them in the main loop.
+  const placed = new Set();
 
-  for (let index = 0; index < messages.length; index++) {
-    const message = messages[index];
+  for (let i = 0; i < messages.length; i++) {
+    if (placed.has(i)) continue;
+
+    const message = messages[i];
     repaired.push(message);
+    placed.add(i);
 
-    if (message.role !== "assistant" || !Array.isArray(message.tool_calls) || message.tool_calls.length === 0) {
+    if (
+      message.role !== "assistant" ||
+      !Array.isArray(message.tool_calls) ||
+      message.tool_calls.length === 0
+    ) {
       continue;
     }
 
-    const pendingIds = new Set(message.tool_calls.map(toolCall => toolCall.id).filter(Boolean));
+    const pendingIds = new Set(
+      message.tool_calls.map(tc => tc.id).filter(Boolean)
+    );
     if (pendingIds.size === 0) continue;
 
-    let cursor = index + 1;
-    while (cursor < messages.length && pendingIds.size > 0) {
-      const next = messages[cursor];
-      if (next.role === "tool" && pendingIds.has(next.tool_call_id)) {
-        repaired.push(next);
-        pendingIds.delete(next.tool_call_id);
-        messages.splice(cursor, 1);
-        continue;
+    // Scan the rest of the array for matching tool results and pull them forward.
+    for (let j = i + 1; j < messages.length && pendingIds.size > 0; j++) {
+      if (placed.has(j)) continue;
+      const candidate = messages[j];
+      if (candidate.role === "tool" && pendingIds.has(candidate.tool_call_id)) {
+        repaired.push(candidate);
+        placed.add(j);
+        pendingIds.delete(candidate.tool_call_id);
       }
-
-      cursor++;
     }
 
     if (pendingIds.size > 0) {
-      console.warn(`[tool-order] Eksik tool_result bulundu: ${Array.from(pendingIds).join(", ")}`);
+      console.warn(`[tool-order] Missing tool_result for call IDs: ${Array.from(pendingIds).join(", ")}`);
     }
   }
 
@@ -489,7 +496,13 @@ function convertOpenAIStreamLine(line, res, state, requestedModel) {
 
   if (typeof delta.content === "string" && delta.content.length > 0) {
     ensureTextBlock(res, state);
-    state.outputTokens += 1;
+    // [FIX #8] Use upstream usage.completion_tokens when available.
+    // Fall back to character-based estimation (÷4) only when the chunk has no usage.
+    if (chunk.usage?.completion_tokens != null) {
+      state.outputTokens = chunk.usage.completion_tokens;
+    } else {
+      state.outputTokens += Math.ceil(delta.content.length / 4) || 1;
+    }
     writeSse(res, "content_block_delta", {
       type: "content_block_delta",
       index: state.textBlockIndex,
@@ -524,31 +537,61 @@ function ensureTextBlock(res, state) {
   });
 }
 
+// [FIX #4] Tool name and id are now buffered and the content_block_start event
+// is deferred until we have a non-empty name. This prevents emitting a block
+// with name: "" when the name arrives in a later streaming chunk.
 function ensureToolBlock(res, state, toolCall) {
-  const index = toolCall.index || 0;
+  const index = toolCall.index ?? 0;
   const existing = state.toolBlocks.get(index);
+
   if (existing) {
+    // Update id/name from later chunks if we haven't emitted the block_start yet.
     if (toolCall.id) existing.id = toolCall.id;
-    if (toolCall.function?.name) existing.name = toolCall.function.name;
+    if (toolCall.function?.name) {
+      if (!existing.started) {
+        existing.name = toolCall.function.name;
+      }
+    }
+    // Emit the deferred block_start once we have a name.
+    if (!existing.started && existing.name) {
+      existing.started = true;
+      writeSse(res, "content_block_start", {
+        type: "content_block_start",
+        index: existing.blockIndex,
+        content_block: {
+          type: "tool_use",
+          id: existing.id,
+          name: existing.name,
+          input: {},
+        },
+      });
+    }
     return;
   }
 
+  const name = toolCall.function?.name || "";
   const block = {
     blockIndex: state.nextBlockIndex++,
     id: toolCall.id || `toolu_${Date.now()}_${index}`,
-    name: toolCall.function?.name || "tool",
+    name,
+    started: false, // block_start not yet emitted
   };
   state.toolBlocks.set(index, block);
-  writeSse(res, "content_block_start", {
-    type: "content_block_start",
-    index: block.blockIndex,
-    content_block: {
-      type: "tool_use",
-      id: block.id,
-      name: block.name,
-      input: {},
-    },
-  });
+
+  // Only emit block_start immediately if the name is already known.
+  if (name) {
+    block.started = true;
+    writeSse(res, "content_block_start", {
+      type: "content_block_start",
+      index: block.blockIndex,
+      content_block: {
+        type: "tool_use",
+        id: block.id,
+        name: block.name,
+        input: {},
+      },
+    });
+  }
 }
 
 function closeOpenBlocks(res, state) {
@@ -563,6 +606,20 @@ function closeOpenBlocks(res, state) {
   }
 
   for (const block of state.toolBlocks.values()) {
+    // Flush any blocks that were created but whose block_start was still deferred.
+    if (!block.started) {
+      block.started = true;
+      writeSse(res, "content_block_start", {
+        type: "content_block_start",
+        index: block.blockIndex,
+        content_block: {
+          type: "tool_use",
+          id: block.id,
+          name: block.name || "tool",
+          input: {},
+        },
+      });
+    }
     writeSse(res, "content_block_stop", {
       type: "content_block_stop",
       index: block.blockIndex,
@@ -629,17 +686,26 @@ function handleMessages(req, res, body, apiKey) {
       stopReason: "end_turn",
     };
     let buffer = "";
-    let failed = false;
+
+    // [FIX #2] Check the HTTP status code only once (on the first data event).
+    // Subsequent onData calls for the same response always share the same status,
+    // but guarding with a flag makes the intent explicit and avoids redundant work.
+    let statusChecked = false;
+    let upstreamFailed = false;
 
     requestUpstream("POST", "/chat/completions", openaiBody, apiKey, {
       onData: (chunk, statusCode) => {
-        if (failed) return;
-        if (statusCode < 200 || statusCode >= 300) {
-          failed = true;
-          console.error(`[upstream ${statusCode}] ${chunk.toString("utf8")}`);
-          writeSse(res, "error", anthropicError(statusCode, chunk.toString("utf8"), "api_error"));
-          res.end();
-          return;
+        if (upstreamFailed) return;
+
+        if (!statusChecked) {
+          statusChecked = true;
+          if (statusCode < 200 || statusCode >= 300) {
+            upstreamFailed = true;
+            console.error(`[upstream ${statusCode}] ${chunk.toString("utf8")}`);
+            writeSse(res, "error", anthropicError(statusCode, chunk.toString("utf8"), "api_error"));
+            res.end();
+            return;
+          }
         }
 
         buffer += chunk.toString("utf8");
@@ -650,10 +716,10 @@ function handleMessages(req, res, body, apiKey) {
         }
       },
       onEnd: (raw, statusCode) => {
-        if (failed || res.writableEnded) return;
+        if (upstreamFailed || res.writableEnded) return;
         if (statusCode < 200 || statusCode >= 300) {
-          console.error(`[upstream ${statusCode}] ${raw || "Upstream API hatasi"}`);
-          writeSse(res, "error", anthropicError(statusCode, raw || "Upstream API hatasi", "api_error"));
+          console.error(`[upstream ${statusCode}] ${raw || "Upstream API error"}`);
+          writeSse(res, "error", anthropicError(statusCode, raw || "Upstream API error", "api_error"));
           res.end();
           return;
         }
@@ -687,7 +753,7 @@ function handleMessages(req, res, body, apiKey) {
       try {
         data = JSON.parse(raw);
       } catch (err) {
-        jsonResponse(res, 502, anthropicError(502, `Upstream yaniti parse edilemedi: ${err.message}`, "api_error"));
+        jsonResponse(res, 502, anthropicError(502, `Failed to parse upstream response: ${err.message}`, "api_error"));
         return;
       }
 
@@ -695,7 +761,7 @@ function handleMessages(req, res, body, apiKey) {
         console.error(`[upstream ${statusCode}] ${raw}`);
         jsonResponse(res, statusCode, anthropicError(
           statusCode,
-          data.error?.message || "OpenCode Go API hatasi",
+          data.error?.message || "OpenCode Go API error",
           data.error?.type || "api_error",
         ));
         return;
@@ -709,20 +775,57 @@ function handleMessages(req, res, body, apiKey) {
   });
 }
 
+// [FIX #3] Improved token estimation that accounts for tools and image blocks.
+// Tool definitions are large and significantly affect the input budget.
 function estimateInputTokens(body) {
-  const text = [
-    contentToText(body.system),
-    ...(body.messages || []).map(message => contentToText(message.content)),
-  ].join("\n");
+  const textParts = [contentToText(body.system)];
 
-  return Math.max(1, Math.ceil(text.length / 4));
+  for (const message of body.messages || []) {
+    const content = message.content;
+    if (typeof content === "string") {
+      textParts.push(content);
+    } else if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block.type === "text") {
+          textParts.push(block.text || "");
+        } else if (block.type === "tool_result") {
+          textParts.push(contentToText(block.content));
+        } else if (block.type === "image") {
+          // Images contribute a fixed overhead (~1600 tokens for a typical vision image).
+          // We add a placeholder string to the running total rather than a magic number.
+          textParts.push(" ".repeat(1600 * 4));
+        }
+      }
+    }
+  }
+
+  // Tool definitions are serialized and included in the prompt by the provider.
+  for (const tool of body.tools || []) {
+    textParts.push(tool.name || "");
+    textParts.push(tool.description || "");
+    textParts.push(JSON.stringify(tool.input_schema || {}));
+  }
+
+  const totalChars = textParts.join("\n").length;
+  return Math.max(1, Math.ceil(totalChars / 4));
 }
 
 const server = http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   const pathname = requestUrl.pathname;
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  // [FIX #9] Restrict CORS to configured origins; fall back to wildcard only when
+  // ALLOWED_ORIGINS is explicitly set to "*" in the environment.
+  const origin = req.headers.origin || "";
+  if (ALLOWED_ORIGINS === null) {
+    // Default: allow only same-origin / no-origin (localhost) requests.
+    // Do not set Access-Control-Allow-Origin so browsers block cross-origin calls.
+  } else if (ALLOWED_ORIGINS.includes("*")) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  } else if (ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Anthropic-Version, Anthropic-Beta");
 
@@ -735,7 +838,7 @@ const server = http.createServer(async (req, res) => {
   if ((pathname === "/" || pathname === "/health") && req.method === "GET") {
     jsonResponse(res, 200, {
       status: "ok",
-      message: "Anthropic -> OpenCode Go proxy calisiyor",
+      message: "Anthropic -> OpenCode Go proxy running",
       upstream: OPENCODE_API_URL,
       models: {
         opus: OPUS_MODEL,
@@ -748,7 +851,7 @@ const server = http.createServer(async (req, res) => {
 
   const apiKey = extractApiKey(req);
   if (!apiKey && ["/v1/messages", "/v1/messages/count_tokens", "/v1/models"].includes(pathname)) {
-    jsonResponse(res, 401, anthropicError(401, "API anahtari eksik", "authentication_error"));
+    jsonResponse(res, 401, anthropicError(401, "Missing API key", "authentication_error"));
     return;
   }
 
@@ -763,7 +866,7 @@ const server = http.createServer(async (req, res) => {
       const raw = await readBody(req);
       body = JSON.parse(raw || "{}");
     } catch {
-      jsonResponse(res, 400, anthropicError(400, "Gecersiz JSON", "invalid_request_error"));
+      jsonResponse(res, 400, anthropicError(400, "Invalid JSON", "invalid_request_error"));
       return;
     }
 
@@ -777,7 +880,7 @@ const server = http.createServer(async (req, res) => {
       const raw = await readBody(req);
       body = JSON.parse(raw || "{}");
     } catch {
-      jsonResponse(res, 400, anthropicError(400, "Gecersiz JSON", "invalid_request_error"));
+      jsonResponse(res, 400, anthropicError(400, "Invalid JSON", "invalid_request_error"));
       return;
     }
 
@@ -785,23 +888,23 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  jsonResponse(res, 404, anthropicError(404, "Endpoint bulunamadi", "not_found_error"));
+  jsonResponse(res, 404, anthropicError(404, "Endpoint not found", "not_found_error"));
 });
 
 server.listen(PORT, () => {
   console.log(`
 Anthropic -> OpenCode Go Proxy
-Dinleniyor : http://localhost:${PORT}
-Endpoint   : /v1/messages
-Models     : /v1/models
-Upstream   : ${OPENCODE_API_URL}
+Listening : http://localhost:${PORT}
+Endpoint  : /v1/messages
+Models    : /v1/models
+Upstream  : ${OPENCODE_API_URL}
 Opus      : ${OPUS_MODEL}
 Sonnet    : ${SONNET_MODEL}
 Haiku     : ${HAIKU_MODEL}
-API Key    : ${OPENCODE_API_KEY ? "env ile ayarli" : "Claude Code x-api-key/Authorization header bekleniyor"}
-Mapping    : claude-*opus* -> Opus, claude-*sonnet* -> Sonnet, claude-*haiku* -> Haiku
+API Key   : ${OPENCODE_API_KEY ? "set via env" : "expected from Claude Code x-api-key / Authorization header"}
+CORS      : ${ALLOWED_ORIGINS ? ALLOWED_ORIGINS.join(", ") : "localhost only (set ALLOWED_ORIGINS=* to allow all)"}
 
-Claude Code ornegi:
+Claude Code example:
   export ANTHROPIC_BASE_URL="http://localhost:${PORT}"
   export ANTHROPIC_API_KEY="<opencode-go-api-key>"
   export ANTHROPIC_MODEL="claude-sonnet-4-5"
@@ -811,9 +914,9 @@ Claude Code ornegi:
 
 server.on("error", err => {
   if (err.code === "EADDRINUSE") {
-    console.error(`Port ${PORT} kullanimda. PORT env degiskenini degistirin.`);
+    console.error(`Port ${PORT} is already in use. Change the PORT env variable.`);
   } else {
-    console.error("Sunucu hatasi:", err);
+    console.error("Server error:", err);
   }
   process.exit(1);
 });
