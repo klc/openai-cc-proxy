@@ -57,6 +57,23 @@ const OPUS_MODEL = process.env.OPUS_MODEL || process.env.OPENCODE_OPUS_MODEL || 
 const SONNET_MODEL = process.env.SONNET_MODEL || process.env.OPENCODE_SONNET_MODEL || process.env.OPENCODE_DEFAULT_MODEL || "opencode/kimi-k2.6";
 const HAIKU_MODEL = process.env.HAIKU_MODEL || process.env.OPENCODE_HAIKU_MODEL || process.env.OPENCODE_SMALL_FAST_MODEL || "opencode/deepseek-v4-flash";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 600000);
+const TOKEN_DEBUG = parseBoolEnv(process.env.TOKEN_DEBUG, false);
+const TOOL_RESULT_MAX_CHARS = parseIntEnv(process.env.TOOL_RESULT_MAX_CHARS, 0);
+const TOOL_RESULT_HEAD_LINES = parseIntEnv(process.env.TOOL_RESULT_HEAD_LINES, 80);
+const TOOL_RESULT_TAIL_LINES = parseIntEnv(process.env.TOOL_RESULT_TAIL_LINES, 80);
+const TOOL_RESULT_DEDUPE = parseBoolEnv(process.env.TOOL_RESULT_DEDUPE, false);
+const TOOL_SCHEMA_STRIP_DESCRIPTIONS = parseBoolEnv(process.env.TOOL_SCHEMA_STRIP_DESCRIPTIONS, false);
+
+function parseBoolEnv(value, defaultValue = false) {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
+}
+
+function parseIntEnv(value, defaultValue) {
+  if (value === undefined || value === null || value === "") return defaultValue;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : defaultValue;
+}
 
 function createProviderConfig(name, apiUrl, apiKey, extraHeaders = {}) {
   const url = new URL(apiUrl);
@@ -314,6 +331,194 @@ function contentToText(content) {
     .join("\n");
 }
 
+function approxTokens(chars) {
+  return Math.max(0, Math.ceil(chars / 4));
+}
+
+function addStat(stats, key, value) {
+  const chars = String(value || "").length;
+  stats[key] = (stats[key] || 0) + chars;
+}
+
+function analyzeTokenSections(body) {
+  const stats = {
+    system: 0,
+    message_text: 0,
+    assistant_thinking: 0,
+    tool_results: 0,
+    tools: 0,
+    images: 0,
+  };
+
+  addStat(stats, "system", contentToText(body.system));
+
+  for (const message of body.messages || []) {
+    const content = message.content;
+    if (typeof content === "string") {
+      addStat(stats, "message_text", content);
+      continue;
+    }
+    if (!Array.isArray(content)) {
+      addStat(stats, "message_text", content || "");
+      continue;
+    }
+
+    for (const block of content) {
+      if (block.type === "text") {
+        addStat(stats, "message_text", block.text || "");
+      } else if (block.type === "thinking") {
+        addStat(stats, "assistant_thinking", block.thinking || block.text || "");
+      } else if (block.type === "tool_result") {
+        addStat(stats, "tool_results", contentToText(block.content) || JSON.stringify(block.content || ""));
+      } else if (block.type === "image") {
+        stats.images += 1600 * 4;
+      }
+    }
+  }
+
+  for (const tool of body.tools || []) {
+    addStat(stats, "tools", tool.name || "");
+    addStat(stats, "tools", tool.description || "");
+    addStat(stats, "tools", JSON.stringify(tool.input_schema || {}));
+  }
+
+  const total = Object.values(stats).reduce((sum, value) => sum + value, 0);
+  return { ...stats, total };
+}
+
+function bodyForTokenAnalysis(body) {
+  if (!TOOL_SCHEMA_STRIP_DESCRIPTIONS || !Array.isArray(body.tools)) return body;
+  return {
+    ...body,
+    tools: body.tools.map(tool => ({
+      ...tool,
+      description: "",
+      input_schema: stripSchemaDescriptions(tool.input_schema || {}),
+    })),
+  };
+}
+
+function formatTokenStats(stats) {
+  const keys = ["system", "message_text", "assistant_thinking", "tool_results", "tools", "images", "total"];
+  return keys
+    .map(key => `${key}=${approxTokens(stats[key] || 0)}t/${stats[key] || 0}c`)
+    .join(" ");
+}
+
+function logTokenDebug(label, body, extra = {}) {
+  if (!TOKEN_DEBUG) return;
+  const stats = analyzeTokenSections(bodyForTokenAnalysis(body));
+  const prefix = extra.requestedModel ? `[token-debug] ${label} model=${extra.requestedModel}` : `[token-debug] ${label}`;
+  console.log(`${prefix} ${formatTokenStats(stats)}`);
+}
+
+function logUpstreamUsage(label, usage, extra = {}) {
+  if (!TOKEN_DEBUG || !usage) return;
+  const input = usage.prompt_tokens ?? usage.input_tokens ?? 0;
+  const output = usage.completion_tokens ?? usage.output_tokens ?? 0;
+  const total = usage.total_tokens ?? (input + output);
+  const model = extra.model ? ` model=${extra.model}` : "";
+  const provider = extra.provider ? ` provider=${extra.provider}` : "";
+  console.log(`[token-debug] ${label}${provider}${model} upstream_usage=input=${input} output=${output} total=${total}`);
+}
+
+function dedupeRepeatedLines(text) {
+  const lines = String(text || "").split("\n");
+  if (lines.length < 2) return text;
+
+  const deduped = [];
+  let previous = null;
+  let count = 0;
+
+  const flush = () => {
+    if (previous === null) return;
+    deduped.push(previous);
+    if (count > 1) deduped.push(`[repeated ${count - 1} more times]`);
+  };
+
+  for (const line of lines) {
+    if (line === previous) {
+      count += 1;
+      continue;
+    }
+    flush();
+    previous = line;
+    count = 1;
+  }
+  flush();
+
+  const result = deduped.join("\n");
+  return result.length < String(text || "").length ? result : text;
+}
+
+function truncateText(text, maxChars, headLines, tailLines) {
+  const value = String(text || "");
+  if (!maxChars || value.length <= maxChars) return value;
+
+  const lines = value.split("\n");
+  const head = lines.slice(0, Math.max(0, headLines)).join("\n");
+  const tail = lines.slice(Math.max(0, lines.length - Math.max(0, tailLines))).join("\n");
+  const marker = "\n[truncated]\n";
+  if (maxChars <= marker.length) return value.slice(0, maxChars);
+
+  const candidate = `${head}${marker}${tail}`.trim();
+
+  if (candidate.length <= maxChars) return candidate;
+
+  const headBudget = Math.max(0, Math.floor((maxChars - marker.length) * 0.6));
+  const tailBudget = Math.max(0, maxChars - marker.length - headBudget);
+  return `${value.slice(0, headBudget)}${marker}${value.slice(-tailBudget)}`;
+}
+
+function optimizeToolResultText(text) {
+  let value = String(text || "");
+  if (TOOL_RESULT_DEDUPE) value = dedupeRepeatedLines(value);
+  if (TOOL_RESULT_MAX_CHARS > 0) {
+    value = truncateText(value, TOOL_RESULT_MAX_CHARS, TOOL_RESULT_HEAD_LINES, TOOL_RESULT_TAIL_LINES);
+  }
+  return value;
+}
+
+function optimizeToolResultContent(content) {
+  if (typeof content === "string") return optimizeToolResultText(content);
+  if (!Array.isArray(content)) return content;
+
+  let changed = false;
+  const optimized = content.map(part => {
+    if (!part || part.type !== "text" || typeof part.text !== "string") return part;
+    const text = optimizeToolResultText(part.text);
+    if (text !== part.text) changed = true;
+    return changed ? { ...part, text } : part;
+  });
+
+  return changed ? optimized : content;
+}
+
+function optimizeAnthropicBody(body) {
+  if (!TOOL_RESULT_DEDUPE && TOOL_RESULT_MAX_CHARS <= 0) return body;
+  if (!Array.isArray(body.messages)) return body;
+
+  let changed = false;
+  const messages = body.messages.map(message => {
+    if (!Array.isArray(message.content)) return message;
+
+    let messageChanged = false;
+    const content = message.content.map(block => {
+      if (!block || block.type !== "tool_result") return block;
+      const optimizedContent = optimizeToolResultContent(block.content);
+      if (optimizedContent === block.content) return block;
+      messageChanged = true;
+      return { ...block, content: optimizedContent };
+    });
+
+    if (!messageChanged) return message;
+    changed = true;
+    return { ...message, content };
+  });
+
+  return changed ? { ...body, messages } : body;
+}
+
 function dataUrlFromAnthropicImage(block) {
   const source = block.source || {};
   if (source.type === "base64") {
@@ -485,10 +690,24 @@ function convertAnthropicToolsToOpenAI(tools) {
     type: "function",
     function: {
       name: tool.name,
-      description: tool.description || "",
-      parameters: tool.input_schema || { type: "object", properties: {} },
+      description: TOOL_SCHEMA_STRIP_DESCRIPTIONS ? "" : (tool.description || ""),
+      parameters: TOOL_SCHEMA_STRIP_DESCRIPTIONS
+        ? stripSchemaDescriptions(tool.input_schema || { type: "object", properties: {} })
+        : (tool.input_schema || { type: "object", properties: {} }),
     },
   }));
+}
+
+function stripSchemaDescriptions(value) {
+  if (Array.isArray(value)) return value.map(stripSchemaDescriptions);
+  if (!value || typeof value !== "object") return value;
+
+  const stripped = {};
+  for (const [key, nested] of Object.entries(value)) {
+    if (key === "description") continue;
+    stripped[key] = stripSchemaDescriptions(nested);
+  }
+  return stripped;
 }
 
 function convertAnthropicToolChoiceToOpenAI(toolChoice) {
@@ -666,6 +885,13 @@ function convertOpenAIStreamLine(line, res, state, requestedModel) {
   if (choice.finish_reason) {
     state.stopReason = openAIStopToAnthropic(choice.finish_reason);
   }
+
+  if (chunk.usage?.prompt_tokens != null) {
+    state.inputTokens = chunk.usage.prompt_tokens;
+  }
+  if (chunk.usage?.completion_tokens != null) {
+    state.outputTokens = chunk.usage.completion_tokens;
+  }
 }
 
 function ensureTextBlock(res, state) {
@@ -795,6 +1021,11 @@ function proxyModels(req, res) {
 function handleMessages(req, res, body) {
   const requestedModel = body.model || "(default sonnet)";
   const streaming = body.stream === true;
+  const optimizedBody = optimizeAnthropicBody(body);
+  logTokenDebug("request", body, { requestedModel });
+  if (optimizedBody !== body) {
+    logTokenDebug("optimized_request", optimizedBody, { requestedModel });
+  }
   const triedSlots = new Set();
   let currentLease = null;
 
@@ -831,6 +1062,7 @@ function handleMessages(req, res, body) {
       textBlockOpen: false,
       textBlockIndex: null,
       toolBlocks: new Map(),
+      inputTokens: 0,
       outputTokens: 0,
       stopReason: "end_turn",
     };
@@ -850,7 +1082,7 @@ function handleMessages(req, res, body) {
         return;
       }
 
-      const openaiBody = convertAnthropicRequestToOpenAI(body, modelLease.model);
+      const openaiBody = convertAnthropicRequestToOpenAI(optimizedBody, modelLease.model);
       let buffer = "";
       let errorRaw = "";
       logAttempt(modelLease);
@@ -871,7 +1103,13 @@ function handleMessages(req, res, body) {
         },
         onEnd: (raw, statusCode) => {
           releaseCurrentModel();
-          if (res.writableEnded) return;
+          if (res.writableEnded) {
+            logUpstreamUsage("stream_response", {
+              prompt_tokens: state.inputTokens,
+              completion_tokens: state.outputTokens,
+            }, { provider: modelLease.provider, model: modelLease.model });
+            return;
+          }
           if (statusCode < 200 || statusCode >= 300) {
             const errorBody = errorRaw || raw || "Upstream API error";
             console.error(`[upstream ${statusCode}] ${errorBody}`);
@@ -898,6 +1136,10 @@ function handleMessages(req, res, body) {
             writeSse(res, "message_stop", { type: "message_stop" });
             res.end();
           }
+          logUpstreamUsage("stream_response", {
+            prompt_tokens: state.inputTokens,
+            completion_tokens: state.outputTokens,
+          }, { provider: modelLease.provider, model: modelLease.model });
         },
         onError: err => {
           releaseCurrentModel();
@@ -925,7 +1167,7 @@ function handleMessages(req, res, body) {
       return;
     }
 
-    const openaiBody = convertAnthropicRequestToOpenAI(body, modelLease.model);
+    const openaiBody = convertAnthropicRequestToOpenAI(optimizedBody, modelLease.model);
     logAttempt(modelLease);
 
     requestUpstream(modelLease.provider, "POST", "/chat/completions", openaiBody, apiKey, {
@@ -954,6 +1196,7 @@ function handleMessages(req, res, body) {
           return;
         }
 
+        logUpstreamUsage("response", data.usage, { provider: modelLease.provider, model: modelLease.model });
         jsonResponse(res, 200, convertOpenAIResponseToAnthropic(data, requestedModel));
       },
       onError: err => {
@@ -993,8 +1236,12 @@ function estimateInputTokens(body) {
   // Tool definitions are serialized and included in the prompt by the provider.
   for (const tool of body.tools || []) {
     textParts.push(tool.name || "");
-    textParts.push(tool.description || "");
-    textParts.push(JSON.stringify(tool.input_schema || {}));
+    if (!TOOL_SCHEMA_STRIP_DESCRIPTIONS) textParts.push(tool.description || "");
+    textParts.push(JSON.stringify(
+      TOOL_SCHEMA_STRIP_DESCRIPTIONS
+        ? stripSchemaDescriptions(tool.input_schema || {})
+        : (tool.input_schema || {})
+    ));
   }
 
   const totalChars = textParts.join("\n").length;
@@ -1061,7 +1308,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    jsonResponse(res, 200, { input_tokens: estimateInputTokens(body) });
+    const optimizedBody = optimizeAnthropicBody(body);
+    logTokenDebug("count_tokens_request", body, { requestedModel: body.model || "(count_tokens)" });
+    if (optimizedBody !== body) {
+      logTokenDebug("count_tokens_optimized_request", optimizedBody, { requestedModel: body.model || "(count_tokens)" });
+    }
+    jsonResponse(res, 200, { input_tokens: estimateInputTokens(optimizedBody) });
     return;
   }
 
@@ -1095,6 +1347,7 @@ Sonnet    : ${SONNET_MODELS.map(formatModelSpec).join(", ")}
 Haiku     : ${HAIKU_MODELS.map(formatModelSpec).join(", ")}
 API Key   : ${providerNames().map(name => `${name}:${PROVIDERS[name].apiKey ? "env" : "request"}`).join(", ")}
 CORS      : ${ALLOWED_ORIGINS ? ALLOWED_ORIGINS.join(", ") : "localhost only (set ALLOWED_ORIGINS=* to allow all)"}
+Token Opt : debug=${TOKEN_DEBUG ? "on" : "off"}, tool_result_max=${TOOL_RESULT_MAX_CHARS || "off"}, dedupe=${TOOL_RESULT_DEDUPE ? "on" : "off"}, strip_tool_descriptions=${TOOL_SCHEMA_STRIP_DESCRIPTIONS ? "on" : "off"}
 
 Claude Code example:
   export ANTHROPIC_BASE_URL="http://localhost:${PORT}"

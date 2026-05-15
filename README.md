@@ -59,6 +59,30 @@ REQUEST_TIMEOUT_MS=600000
 
 You can either set provider-specific keys in `.env`, or leave them empty and let Claude Code pass one key through `ANTHROPIC_API_KEY`. For mixed providers, set `OPENCODE_API_KEY` and `OPENROUTER_API_KEY` separately so each upstream receives the right key.
 
+## Token Optimization
+
+Token optimization is controlled by environment flags. By default, lossy changes
+are disabled and the proxy preserves the request body.
+
+```env
+TOKEN_DEBUG=1
+TOOL_RESULT_DEDUPE=1
+TOOL_RESULT_MAX_CHARS=12000
+TOOL_RESULT_HEAD_LINES=80
+TOOL_RESULT_TAIL_LINES=80
+TOOL_SCHEMA_STRIP_DESCRIPTIONS=0
+```
+
+- `TOKEN_DEBUG=1` logs approximate request token sections and upstream usage when available.
+- `TOOL_RESULT_DEDUPE=1` collapses consecutive repeated lines in tool results.
+- `TOOL_RESULT_MAX_CHARS` truncates large tool results while preserving head and tail context. `0` disables truncation.
+- `TOOL_RESULT_HEAD_LINES` and `TOOL_RESULT_TAIL_LINES` control how much line context is kept around truncation.
+- `TOOL_SCHEMA_STRIP_DESCRIPTIONS=1` removes tool and schema `description` fields before forwarding upstream. This can reduce input tokens, but it may reduce tool-call quality, so enable it only after checking `TOKEN_DEBUG` logs.
+
+These settings reduce tokens only when they change the actual text sent to the
+provider. HTTP compression such as gzip can reduce bandwidth, but not billable
+prompt or completion tokens.
+
 ## Run
 
 ```sh
