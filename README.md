@@ -49,7 +49,7 @@ PORT=3100
 OPENCODE_API_KEY=
 OPENCODE_API_URL=https://opencode.ai/zen/go/v1
 OPENCODE_OPUS_MODEL=kimi-k2.6
-OPENCODE_SONNET_MODEL=deepseek-v4-pro
+OPENCODE_SONNET_MODEL=deepseek-v4-pro,qwen3.6-plus
 OPENCODE_HAIKU_MODEL=deepseek-v4-flash
 REQUEST_TIMEOUT_MS=600000
 ```
@@ -109,6 +109,22 @@ Claude Code may send changing Claude model names such as `claude-opus-4-7`. The 
 - Any Claude model containing `opus` maps to `OPENCODE_OPUS_MODEL`
 - Any Claude model containing `sonnet` maps to `OPENCODE_SONNET_MODEL`
 - Any Claude model containing `haiku` maps to `OPENCODE_HAIKU_MODEL`
+
+For concurrent requests, each family setting can be a comma-separated model pool:
+
+```env
+OPENCODE_SONNET_MODEL=deepseek-v4-pro,qwen3.6-plus
+```
+
+The first model remains the primary. If there is only one active Sonnet request,
+it is sent to `deepseek-v4-pro`. When another Sonnet request arrives while the
+first is still active, it is sent to `qwen3.6-plus`. If all configured slots are
+busy, the proxy picks the least-busy slot.
+
+If an upstream model returns HTTP 429, the proxy retries the same request with
+the next configured model in that family before returning the error to Claude
+Code. This handles provider-side/global concurrency limits where the proxy only
+sees one local request at a time.
 
 You can also bypass family mapping by sending an OpenCode Go model directly:
 

@@ -53,6 +53,25 @@ const SONNET_MODEL = process.env.OPENCODE_SONNET_MODEL || process.env.OPENCODE_D
 const HAIKU_MODEL = process.env.OPENCODE_HAIKU_MODEL || process.env.OPENCODE_SMALL_FAST_MODEL || "deepseek-v4-flash";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 600000);
 
+function parseModelList(raw) {
+  const models = raw.split(",").map(model => model.trim()).filter(Boolean);
+  return models.length > 0 ? models : [];
+}
+
+const OPUS_MODELS = parseModelList(OPUS_MODEL);
+const SONNET_MODELS = parseModelList(SONNET_MODEL);
+const HAIKU_MODELS = parseModelList(HAIKU_MODEL);
+const FAMILY_MODEL_POOLS = {
+  opus: OPUS_MODELS,
+  sonnet: SONNET_MODELS,
+  haiku: HAIKU_MODELS,
+};
+const activeFamilySlots = {
+  opus: Array(OPUS_MODELS.length).fill(0),
+  sonnet: Array(SONNET_MODELS.length).fill(0),
+  haiku: Array(HAIKU_MODELS.length).fill(0),
+};
+
 // [FIX #9] Read allowed origins from env; default to localhost-only for security.
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
@@ -77,19 +96,71 @@ const LOCAL_MODELS = [
   "qwen3.5-plus",
 ];
 
-// [FIX #5] Removed static MODEL_MAP — family-based matching below is sufficient
-// and avoids stale hardcoded version strings.
-function mapModel(model) {
-  if (!model) return SONNET_MODEL;
-  if (model.startsWith("opencode-go/")) return model.slice("opencode-go/".length);
-
+function modelFamily(model) {
+  if (!model) return "sonnet";
   const normalized = model.toLowerCase();
-  if (normalized.includes("opus")) return OPUS_MODEL;
-  if (normalized.includes("sonnet")) return SONNET_MODEL;
-  if (normalized.includes("haiku")) return HAIKU_MODEL;
+  if (normalized.includes("opus")) return "opus";
+  if (normalized.includes("sonnet")) return "sonnet";
+  if (normalized.includes("haiku")) return "haiku";
+  return null;
+}
 
-  // Unknown model passed through as-is (e.g. a direct OpenCode Go model name)
-  return model;
+function selectFamilySlot(family, excludedSlots = new Set()) {
+  const slots = activeFamilySlots[family];
+
+  for (let i = 0; i < slots.length; i++) {
+    if (excludedSlots.has(i)) continue;
+    if (slots[i] === 0) return i;
+  }
+
+  let selected = null;
+  for (let i = 0; i < slots.length; i++) {
+    if (excludedSlots.has(i)) continue;
+    if (selected === null) {
+      selected = i;
+      continue;
+    }
+    if (slots[i] < slots[selected]) selected = i;
+  }
+  return selected;
+}
+
+function reserveModel(model, excludedSlots = new Set()) {
+  if (model && model.startsWith("opencode-go/")) {
+    return { model: model.slice("opencode-go/".length), family: "direct", slot: null, release: () => {} };
+  }
+
+  const family = modelFamily(model);
+  if (!family) {
+    // Unknown model passed through as-is (e.g. a direct OpenCode Go model name)
+    return { model, family: "direct", slot: null, release: () => {} };
+  }
+
+  const slot = selectFamilySlot(family, excludedSlots);
+  if (slot === null) return null;
+
+  activeFamilySlots[family][slot] += 1;
+  let released = false;
+
+  return {
+    model: FAMILY_MODEL_POOLS[family][slot],
+    family,
+    slot,
+    release: () => {
+      if (released) return;
+      released = true;
+      activeFamilySlots[family][slot] = Math.max(0, activeFamilySlots[family][slot] - 1);
+    },
+  };
+}
+
+function shouldRetryWithFallback(statusCode, modelLease, triedSlots) {
+  return (
+    statusCode === 429 &&
+    modelLease &&
+    modelLease.family !== "direct" &&
+    triedSlots.size < FAMILY_MODEL_POOLS[modelLease.family].length
+  );
 }
 
 function extractApiKey(req) {
@@ -359,9 +430,9 @@ function convertAnthropicToolChoiceToOpenAI(toolChoice) {
   return undefined;
 }
 
-function convertAnthropicRequestToOpenAI(body) {
+function convertAnthropicRequestToOpenAI(body, model) {
   const openaiBody = {
-    model: mapModel(body.model),
+    model,
     messages: convertAnthropicMessagesToOpenAI(body.messages || [], body.system),
     stream: body.stream === true,
   };
@@ -661,11 +732,28 @@ function proxyModels(req, res, apiKey) {
 }
 
 function handleMessages(req, res, body, apiKey) {
-  const requestedModel = body.model || SONNET_MODEL;
-  const openaiBody = convertAnthropicRequestToOpenAI(body);
+  const requestedModel = body.model || "(default sonnet)";
   const streaming = body.stream === true;
+  const triedSlots = new Set();
+  let currentLease = null;
 
-  console.log(`[${new Date().toISOString()}] ${requestedModel} -> ${openaiBody.model} (stream: ${streaming})`);
+  const releaseCurrentModel = () => {
+    if (!currentLease) return;
+    currentLease.release();
+    currentLease = null;
+  };
+  const reserveNextModel = () => {
+    const modelLease = reserveModel(body.model, triedSlots);
+    if (!modelLease) return null;
+    currentLease = modelLease;
+    if (modelLease.slot !== null) triedSlots.add(modelLease.slot);
+    return modelLease;
+  };
+  const logAttempt = modelLease => {
+    console.log(`[${new Date().toISOString()}] ${requestedModel} -> ${modelLease.model} (stream: ${streaming}, pool: ${modelLease.family}${modelLease.slot === null ? "" : `#${modelLease.slot + 1}`})`);
+  };
+
+  res.on("close", releaseCurrentModel);
 
   if (streaming) {
     res.writeHead(200, {
@@ -685,94 +773,123 @@ function handleMessages(req, res, body, apiKey) {
       outputTokens: 0,
       stopReason: "end_turn",
     };
-    let buffer = "";
 
-    // [FIX #2] Check the HTTP status code only once (on the first data event).
-    // Subsequent onData calls for the same response always share the same status,
-    // but guarding with a flag makes the intent explicit and avoids redundant work.
-    let statusChecked = false;
-    let upstreamFailed = false;
+    const startStreamingAttempt = () => {
+      const modelLease = reserveNextModel();
+      if (!modelLease) {
+        writeSse(res, "error", anthropicError(429, "All fallback models failed or were unavailable", "rate_limit_error"));
+        res.end();
+        return;
+      }
 
-    requestUpstream("POST", "/chat/completions", openaiBody, apiKey, {
-      onData: (chunk, statusCode) => {
-        if (upstreamFailed) return;
+      const openaiBody = convertAnthropicRequestToOpenAI(body, modelLease.model);
+      let buffer = "";
+      let errorRaw = "";
+      logAttempt(modelLease);
 
-        if (!statusChecked) {
-          statusChecked = true;
+      requestUpstream("POST", "/chat/completions", openaiBody, apiKey, {
+        onData: (chunk, statusCode) => {
           if (statusCode < 200 || statusCode >= 300) {
-            upstreamFailed = true;
-            console.error(`[upstream ${statusCode}] ${chunk.toString("utf8")}`);
-            writeSse(res, "error", anthropicError(statusCode, chunk.toString("utf8"), "api_error"));
+            errorRaw += chunk.toString("utf8");
+            return;
+          }
+
+          buffer += chunk.toString("utf8");
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            convertOpenAIStreamLine(line.trimEnd(), res, state, requestedModel);
+          }
+        },
+        onEnd: (raw, statusCode) => {
+          releaseCurrentModel();
+          if (res.writableEnded) return;
+          if (statusCode < 200 || statusCode >= 300) {
+            const errorBody = errorRaw || raw || "Upstream API error";
+            console.error(`[upstream ${statusCode}] ${errorBody}`);
+            if (shouldRetryWithFallback(statusCode, modelLease, triedSlots)) {
+              console.warn(`[fallback] ${modelLease.model} returned ${statusCode}; trying next ${modelLease.family} model`);
+              startStreamingAttempt();
+              return;
+            }
+            writeSse(res, "error", anthropicError(statusCode, errorBody, "api_error"));
             res.end();
             return;
           }
-        }
 
-        buffer += chunk.toString("utf8");
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) {
-          convertOpenAIStreamLine(line.trimEnd(), res, state, requestedModel);
-        }
-      },
-      onEnd: (raw, statusCode) => {
-        if (upstreamFailed || res.writableEnded) return;
-        if (statusCode < 200 || statusCode >= 300) {
-          console.error(`[upstream ${statusCode}] ${raw || "Upstream API error"}`);
-          writeSse(res, "error", anthropicError(statusCode, raw || "Upstream API error", "api_error"));
+          if (buffer.trim()) {
+            convertOpenAIStreamLine(buffer.trim(), res, state, requestedModel);
+          }
+          if (!res.writableEnded) {
+            closeOpenBlocks(res, state);
+            writeSse(res, "message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: state.stopReason, stop_sequence: null },
+              usage: { output_tokens: state.outputTokens },
+            });
+            writeSse(res, "message_stop", { type: "message_stop" });
+            res.end();
+          }
+        },
+        onError: err => {
+          releaseCurrentModel();
+          if (res.writableEnded) return;
+          writeSse(res, "error", anthropicError(500, err.message, "api_error"));
           res.end();
-          return;
-        }
+        },
+      });
+    };
 
-        if (buffer.trim()) {
-          convertOpenAIStreamLine(buffer.trim(), res, state, requestedModel);
-        }
-        if (!res.writableEnded) {
-          closeOpenBlocks(res, state);
-          writeSse(res, "message_delta", {
-            type: "message_delta",
-            delta: { stop_reason: state.stopReason, stop_sequence: null },
-            usage: { output_tokens: state.outputTokens },
-          });
-          writeSse(res, "message_stop", { type: "message_stop" });
-          res.end();
-        }
-      },
-      onError: err => {
-        if (res.writableEnded) return;
-        writeSse(res, "error", anthropicError(500, err.message, "api_error"));
-        res.end();
-      },
-    });
+    startStreamingAttempt();
     return;
   }
 
-  requestUpstream("POST", "/chat/completions", openaiBody, apiKey, {
-    onEnd: (raw, statusCode) => {
-      let data;
-      try {
-        data = JSON.parse(raw);
-      } catch (err) {
-        jsonResponse(res, 502, anthropicError(502, `Failed to parse upstream response: ${err.message}`, "api_error"));
-        return;
-      }
+  const startNonStreamingAttempt = () => {
+    const modelLease = reserveNextModel();
+    if (!modelLease) {
+      jsonResponse(res, 429, anthropicError(429, "All fallback models failed or were unavailable", "rate_limit_error"));
+      return;
+    }
 
-      if (statusCode < 200 || statusCode >= 300) {
-        console.error(`[upstream ${statusCode}] ${raw}`);
-        jsonResponse(res, statusCode, anthropicError(
-          statusCode,
-          data.error?.message || "OpenCode Go API error",
-          data.error?.type || "api_error",
-        ));
-        return;
-      }
+    const openaiBody = convertAnthropicRequestToOpenAI(body, modelLease.model);
+    logAttempt(modelLease);
 
-      jsonResponse(res, 200, convertOpenAIResponseToAnthropic(data, requestedModel));
-    },
-    onError: err => {
-      jsonResponse(res, 500, anthropicError(500, err.message, "api_error"));
-    },
-  });
+    requestUpstream("POST", "/chat/completions", openaiBody, apiKey, {
+      onEnd: (raw, statusCode) => {
+        releaseCurrentModel();
+        let data;
+        try {
+          data = JSON.parse(raw);
+        } catch (err) {
+          jsonResponse(res, 502, anthropicError(502, `Failed to parse upstream response: ${err.message}`, "api_error"));
+          return;
+        }
+
+        if (statusCode < 200 || statusCode >= 300) {
+          console.error(`[upstream ${statusCode}] ${raw}`);
+          if (shouldRetryWithFallback(statusCode, modelLease, triedSlots)) {
+            console.warn(`[fallback] ${modelLease.model} returned ${statusCode}; trying next ${modelLease.family} model`);
+            startNonStreamingAttempt();
+            return;
+          }
+          jsonResponse(res, statusCode, anthropicError(
+            statusCode,
+            data.error?.message || "OpenCode Go API error",
+            data.error?.type || "api_error",
+          ));
+          return;
+        }
+
+        jsonResponse(res, 200, convertOpenAIResponseToAnthropic(data, requestedModel));
+      },
+      onError: err => {
+        releaseCurrentModel();
+        jsonResponse(res, 500, anthropicError(500, err.message, "api_error"));
+      },
+    });
+  };
+
+  startNonStreamingAttempt();
 }
 
 // [FIX #3] Improved token estimation that accounts for tools and image blocks.
@@ -841,9 +958,9 @@ const server = http.createServer(async (req, res) => {
       message: "Anthropic -> OpenCode Go proxy running",
       upstream: OPENCODE_API_URL,
       models: {
-        opus: OPUS_MODEL,
-        sonnet: SONNET_MODEL,
-        haiku: HAIKU_MODEL,
+        opus: OPUS_MODELS,
+        sonnet: SONNET_MODELS,
+        haiku: HAIKU_MODELS,
       },
     });
     return;
@@ -898,9 +1015,9 @@ Listening : http://localhost:${PORT}
 Endpoint  : /v1/messages
 Models    : /v1/models
 Upstream  : ${OPENCODE_API_URL}
-Opus      : ${OPUS_MODEL}
-Sonnet    : ${SONNET_MODEL}
-Haiku     : ${HAIKU_MODEL}
+Opus      : ${OPUS_MODELS.join(", ")}
+Sonnet    : ${SONNET_MODELS.join(", ")}
+Haiku     : ${HAIKU_MODELS.join(", ")}
 API Key   : ${OPENCODE_API_KEY ? "set via env" : "expected from Claude Code x-api-key / Authorization header"}
 CORS      : ${ALLOWED_ORIGINS ? ALLOWED_ORIGINS.join(", ") : "localhost only (set ALLOWED_ORIGINS=* to allow all)"}
 
