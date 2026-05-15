@@ -40,24 +40,54 @@ Copy the example environment file:
 
 ```sh
 cp .env.example .env
+cp settings.example.json settings.json
 ```
 
-Edit `.env`:
+Edit `settings.json` with your OpenAI-compatible providers:
+
+```json
+{
+  "x": {
+    "token": "qwerty",
+    "url": "https://example.com/v1"
+  },
+  "y": {
+    "token": "zxcv",
+    "url": "https://example.org/v1",
+    "headers": {
+      "X-Title": "openai-cc-proxy"
+    }
+  }
+}
+```
+
+`settings.json` is ignored by git because it may contain provider tokens. Commit
+only `settings.example.json`.
+
+Edit `.env` for routing and proxy behavior:
 
 ```env
 PORT=3100
-DEFAULT_PROVIDER=opencode
+DEFAULT_PROVIDER=x
+OPUS_MODEL=x/kimi2.6,y/gemini
+SONNET_MODEL=y/gemini
+HAIKU_MODEL=x/fast-model
+REQUEST_TIMEOUT_MS=600000
+```
+
+You can either set provider-specific tokens in `settings.json`, or leave `token`
+empty and let Claude Code pass one key through `ANTHROPIC_API_KEY`. For mixed
+providers, set tokens in `settings.json` so each upstream receives the right key.
+
+For backward compatibility, the built-in legacy providers still work through
+`.env`:
+
+```env
 OPENCODE_API_KEY=
 OPENROUTER_API_KEY=
 OPENCODE_API_URL=https://opencode.ai/zen/go/v1
 OPENROUTER_API_URL=https://openrouter.ai/api/v1
-OPUS_MODEL=opencode/kimi-k2.6
-SONNET_MODEL=openrouter/deepseek-v4-pro
-HAIKU_MODEL=opencode/deepseek-v4-flash
-REQUEST_TIMEOUT_MS=600000
 ```
-
-You can either set provider-specific keys in `.env`, or leave them empty and let Claude Code pass one key through `ANTHROPIC_API_KEY`. For mixed providers, set `OPENCODE_API_KEY` and `OPENROUTER_API_KEY` separately so each upstream receives the right key.
 
 ## Token Optimization
 
@@ -110,7 +140,9 @@ Add the proxy environment values to the `env` section:
 }
 ```
 
-Replace `<opencode-go-api-key>` with your provider API key if you only use one provider through `ANTHROPIC_API_KEY`. For mixed providers, put keys in `.env` instead.
+Replace `<opencode-go-api-key>` with your provider API key if you only use one
+provider through `ANTHROPIC_API_KEY`. If you use multiple providers, prefer
+putting their tokens in `settings.json` instead.
 
 You can also use shell exports for a single terminal session:
 
@@ -140,9 +172,9 @@ Claude Code may send changing Claude model names such as `claude-opus-4-7`. The 
 Each model entry can include a provider prefix:
 
 ```env
-OPUS_MODEL=opencode/kimi-k2.6
-SONNET_MODEL=openrouter/deepseek-v4-pro
-HAIKU_MODEL=opencode/deepseek-v4-flash
+OPUS_MODEL=x/kimi2.6
+SONNET_MODEL=y/gemini
+HAIKU_MODEL=x/fast-model
 ```
 
 The proxy also accepts `provider:model`, which is useful when the provider model name itself contains `/`:
@@ -151,20 +183,34 @@ The proxy also accepts `provider:model`, which is useful when the provider model
 SONNET_MODEL=openrouter:deepseek/deepseek-chat-v3.1
 ```
 
-Currently configured providers are:
+Providers are configured in `settings.json` as provider-name keys:
 
-- `opencode` via `OPENCODE_API_URL` and `OPENCODE_API_KEY`
-- `openrouter` via `OPENROUTER_API_URL` and `OPENROUTER_API_KEY`
+```json
+{
+  "x": {
+    "token": "qwerty",
+    "url": "https://example.com/v1"
+  },
+  "y": {
+    "token": "zxcv",
+    "url": "https://example.org/v1"
+  }
+}
+```
+
+Each provider supports `url`, `token`, and optional `headers`. The legacy
+`opencode` and `openrouter` providers remain available through `.env`, and a
+same-name entry in `settings.json` overrides the legacy provider config.
 
 For concurrent requests, each family setting can be a comma-separated model pool:
 
 ```env
-SONNET_MODEL=openrouter/deepseek-v4-pro,opencode/qwen3.6-plus
+SONNET_MODEL=x/kimi2.6,y/gemini
 ```
 
 The first model remains the primary. If there is only one active Sonnet request,
-it is sent to `openrouter/deepseek-v4-pro`. When another Sonnet request arrives while the
-first is still active, it is sent to `opencode/qwen3.6-plus`. If all configured slots are
+it is sent to `x/kimi2.6`. When another Sonnet request arrives while the
+first is still active, it is sent to `y/gemini`. If all configured slots are
 busy, the proxy picks the least-busy slot.
 
 If an upstream model returns HTTP 429, the proxy retries the same request with

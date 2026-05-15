@@ -1,0 +1,13 @@
+{
+  "x": {
+    "token": "replace-with-provider-token",
+    "url": "https://example.com/v1",
+    "headers": {
+      "X-Title": "openai-cc-proxy"
+    }
+  },
+  "y": {
+    "token": "replace-with-provider-token",
+    "url": "https://example.org/v1"
+  }
+}

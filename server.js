@@ -47,6 +47,7 @@ loadEnv();
 
 const PORT = Number(process.env.PORT || 3100);
 const REQUESTED_DEFAULT_PROVIDER = (process.env.DEFAULT_PROVIDER || "opencode").toLowerCase();
+const SETTINGS_PATH = path.join(__dirname, "settings.json");
 const OPENCODE_API_URL = process.env.OPENCODE_API_URL || "https://opencode.ai/zen/go/v1";
 const OPENCODE_API_KEY = process.env.OPENCODE_API_KEY || "";
 const OPENROUTER_API_URL = process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1";
@@ -87,17 +88,93 @@ function createProviderConfig(name, apiUrl, apiKey, extraHeaders = {}) {
   };
 }
 
-const PROVIDERS = {
-  opencode: createProviderConfig("opencode", OPENCODE_API_URL, OPENCODE_API_KEY),
-  openrouter: createProviderConfig("openrouter", OPENROUTER_API_URL, OPENROUTER_API_KEY, {
-    ...(OPENROUTER_SITE_URL ? { "HTTP-Referer": OPENROUTER_SITE_URL } : {}),
-    ...(OPENROUTER_APP_NAME ? { "X-Title": OPENROUTER_APP_NAME } : {}),
-  }),
-};
-const DEFAULT_PROVIDER = PROVIDERS[REQUESTED_DEFAULT_PROVIDER] ? REQUESTED_DEFAULT_PROVIDER : "opencode";
+function normalizeProviderName(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+function loadSettingsProviders(filePath = SETTINGS_PATH) {
+  if (!fs.existsSync(filePath)) return {};
+
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch (err) {
+    throw new Error(`[settings] Failed to parse ${filePath}: ${err.message}`);
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`[settings] ${filePath} must contain an object keyed by provider name.`);
+  }
+
+  const providers = {};
+  for (const [rawName, config] of Object.entries(parsed)) {
+    const name = normalizeProviderName(rawName);
+    if (!name) {
+      console.warn(`[settings] Ignoring provider with empty name in ${filePath}`);
+      continue;
+    }
+    if (!config || typeof config !== "object" || Array.isArray(config)) {
+      console.warn(`[settings] Ignoring provider "${rawName}": config must be an object.`);
+      continue;
+    }
+    if (!config.url || typeof config.url !== "string") {
+      console.warn(`[settings] Ignoring provider "${rawName}": missing string url.`);
+      continue;
+    }
+
+    const headers = config.headers && typeof config.headers === "object" && !Array.isArray(config.headers)
+      ? config.headers
+      : {};
+    providers[name] = createProviderConfig(
+      name,
+      config.url,
+      typeof config.token === "string" ? config.token : (typeof config.apiKey === "string" ? config.apiKey : ""),
+      headers,
+    );
+  }
+
+  console.log(`[settings] Loaded ${Object.keys(providers).length} provider(s) from ${filePath}`);
+  return providers;
+}
+
+function buildProviders() {
+  const legacyProviders = {
+    opencode: createProviderConfig("opencode", OPENCODE_API_URL, OPENCODE_API_KEY),
+    openrouter: createProviderConfig("openrouter", OPENROUTER_API_URL, OPENROUTER_API_KEY, {
+      ...(OPENROUTER_SITE_URL ? { "HTTP-Referer": OPENROUTER_SITE_URL } : {}),
+      ...(OPENROUTER_APP_NAME ? { "X-Title": OPENROUTER_APP_NAME } : {}),
+    }),
+  };
+
+  return {
+    ...legacyProviders,
+    ...loadSettingsProviders(),
+  };
+}
+
+const PROVIDERS = buildProviders();
+const DEFAULT_PROVIDER = PROVIDERS[REQUESTED_DEFAULT_PROVIDER]
+  ? REQUESTED_DEFAULT_PROVIDER
+  : (PROVIDERS.opencode ? "opencode" : providerNames()[0]);
+if (REQUESTED_DEFAULT_PROVIDER && REQUESTED_DEFAULT_PROVIDER !== DEFAULT_PROVIDER) {
+  console.warn(`[config] Unknown DEFAULT_PROVIDER "${REQUESTED_DEFAULT_PROVIDER}", using "${DEFAULT_PROVIDER}".`);
+}
 
 function providerNames() {
   return Object.keys(PROVIDERS);
+}
+
+function parseProviderModelPrefix(value, separator) {
+  const index = value.indexOf(separator);
+  if (index <= 0) return null;
+  const provider = normalizeProviderName(value.slice(0, index));
+  const model = value.slice(index + 1).trim();
+  if (!model) return null;
+  if (!PROVIDERS[provider]) {
+    console.warn(`[config] Unknown provider "${provider}" in model spec "${value}". Known providers: ${providerNames().join(", ")}`);
+    return { provider, model, unknownProvider: true };
+  }
+  return { provider, model };
 }
 
 function parseModelSpec(raw) {
@@ -108,19 +185,11 @@ function parseModelSpec(raw) {
     return { provider: "opencode", model: value.slice("opencode-go/".length) };
   }
 
-  const colon = value.indexOf(":");
-  if (colon > 0) {
-    const provider = value.slice(0, colon).toLowerCase();
-    const model = value.slice(colon + 1).trim();
-    if (PROVIDERS[provider] && model) return { provider, model };
-  }
+  const colonSpec = parseProviderModelPrefix(value, ":");
+  if (colonSpec) return colonSpec;
 
-  const slash = value.indexOf("/");
-  if (slash > 0) {
-    const provider = value.slice(0, slash).toLowerCase();
-    const model = value.slice(slash + 1).trim();
-    if (PROVIDERS[provider] && model) return { provider, model };
-  }
+  const slashSpec = parseProviderModelPrefix(value, "/");
+  if (slashSpec) return slashSpec;
 
   return { provider: DEFAULT_PROVIDER, model: value };
 }
@@ -128,6 +197,11 @@ function parseModelSpec(raw) {
 function formatModelSpec(spec) {
   if (!spec) return "";
   return `${spec.provider}/${spec.model}`;
+}
+
+function unknownProviderError(modelLease) {
+  if (!modelLease?.unknownProvider) return null;
+  return `Unknown provider "${modelLease.provider}" in model mapping. Known providers: ${providerNames().join(", ")}`;
 }
 
 function parseModelList(raw) {
@@ -1075,8 +1149,17 @@ function handleMessages(req, res, body) {
         return;
       }
 
+      const providerError = unknownProviderError(modelLease);
+      if (providerError) {
+        releaseCurrentModel();
+        writeSse(res, "error", anthropicError(400, providerError, "invalid_request_error"));
+        res.end();
+        return;
+      }
+
       const apiKey = extractApiKey(req, modelLease.provider);
       if (!apiKey) {
+        releaseCurrentModel();
         writeSse(res, "error", anthropicError(401, `Missing API key for provider: ${modelLease.provider}`, "authentication_error"));
         res.end();
         return;
@@ -1161,8 +1244,16 @@ function handleMessages(req, res, body) {
       return;
     }
 
+    const providerError = unknownProviderError(modelLease);
+    if (providerError) {
+      releaseCurrentModel();
+      jsonResponse(res, 400, anthropicError(400, providerError, "invalid_request_error"));
+      return;
+    }
+
     const apiKey = extractApiKey(req, modelLease.provider);
     if (!apiKey) {
+      releaseCurrentModel();
       jsonResponse(res, 401, anthropicError(401, `Missing API key for provider: ${modelLease.provider}`, "authentication_error"));
       return;
     }
