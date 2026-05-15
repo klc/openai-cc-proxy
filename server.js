@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * Anthropic -> OpenCode Go API Proxy
+ * Anthropic -> OpenAI-compatible API Proxy
  *
  * Claude Code sends Anthropic Messages API requests; this proxy converts them
- * to OpenCode Go's OpenAI-compatible chat/completions API.
+ * to provider-specific OpenAI-compatible chat/completions APIs.
  *
  * Claude Code usage:
  *   export ANTHROPIC_BASE_URL="http://localhost:<PORT>"
- *   export ANTHROPIC_API_KEY="<opencode-go-api-key>"
- *   export ANTHROPIC_MODEL="kimi-k2.6"
+ *   export ANTHROPIC_API_KEY="<provider-api-key>"
+ *   export ANTHROPIC_MODEL="claude-sonnet-4-5"
  *   claude
  */
 
@@ -46,15 +46,75 @@ function loadEnv(filePath = path.join(__dirname, ".env")) {
 loadEnv();
 
 const PORT = Number(process.env.PORT || 3100);
+const REQUESTED_DEFAULT_PROVIDER = (process.env.DEFAULT_PROVIDER || "opencode").toLowerCase();
 const OPENCODE_API_URL = process.env.OPENCODE_API_URL || "https://opencode.ai/zen/go/v1";
 const OPENCODE_API_KEY = process.env.OPENCODE_API_KEY || "";
-const OPUS_MODEL = process.env.OPENCODE_OPUS_MODEL || process.env.OPENCODE_DEFAULT_MODEL || "glm-5.1";
-const SONNET_MODEL = process.env.OPENCODE_SONNET_MODEL || process.env.OPENCODE_DEFAULT_MODEL || "kimi-k2.6";
-const HAIKU_MODEL = process.env.OPENCODE_HAIKU_MODEL || process.env.OPENCODE_SMALL_FAST_MODEL || "deepseek-v4-flash";
+const OPENROUTER_API_URL = process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1";
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "";
+const OPENROUTER_APP_NAME = process.env.OPENROUTER_APP_NAME || "openai-cc-proxy";
+const OPUS_MODEL = process.env.OPUS_MODEL || process.env.OPENCODE_OPUS_MODEL || process.env.OPENCODE_DEFAULT_MODEL || "opencode/glm-5.1";
+const SONNET_MODEL = process.env.SONNET_MODEL || process.env.OPENCODE_SONNET_MODEL || process.env.OPENCODE_DEFAULT_MODEL || "opencode/kimi-k2.6";
+const HAIKU_MODEL = process.env.HAIKU_MODEL || process.env.OPENCODE_HAIKU_MODEL || process.env.OPENCODE_SMALL_FAST_MODEL || "opencode/deepseek-v4-flash";
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 600000);
 
+function createProviderConfig(name, apiUrl, apiKey, extraHeaders = {}) {
+  const url = new URL(apiUrl);
+  return {
+    name,
+    apiKey,
+    url,
+    basePath: url.pathname.replace(/\/$/, ""),
+    client: url.protocol === "http:" ? http : https,
+    extraHeaders,
+  };
+}
+
+const PROVIDERS = {
+  opencode: createProviderConfig("opencode", OPENCODE_API_URL, OPENCODE_API_KEY),
+  openrouter: createProviderConfig("openrouter", OPENROUTER_API_URL, OPENROUTER_API_KEY, {
+    ...(OPENROUTER_SITE_URL ? { "HTTP-Referer": OPENROUTER_SITE_URL } : {}),
+    ...(OPENROUTER_APP_NAME ? { "X-Title": OPENROUTER_APP_NAME } : {}),
+  }),
+};
+const DEFAULT_PROVIDER = PROVIDERS[REQUESTED_DEFAULT_PROVIDER] ? REQUESTED_DEFAULT_PROVIDER : "opencode";
+
+function providerNames() {
+  return Object.keys(PROVIDERS);
+}
+
+function parseModelSpec(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+
+  if (value.startsWith("opencode-go/")) {
+    return { provider: "opencode", model: value.slice("opencode-go/".length) };
+  }
+
+  const colon = value.indexOf(":");
+  if (colon > 0) {
+    const provider = value.slice(0, colon).toLowerCase();
+    const model = value.slice(colon + 1).trim();
+    if (PROVIDERS[provider] && model) return { provider, model };
+  }
+
+  const slash = value.indexOf("/");
+  if (slash > 0) {
+    const provider = value.slice(0, slash).toLowerCase();
+    const model = value.slice(slash + 1).trim();
+    if (PROVIDERS[provider] && model) return { provider, model };
+  }
+
+  return { provider: DEFAULT_PROVIDER, model: value };
+}
+
+function formatModelSpec(spec) {
+  if (!spec) return "";
+  return `${spec.provider}/${spec.model}`;
+}
+
 function parseModelList(raw) {
-  const models = raw.split(",").map(model => model.trim()).filter(Boolean);
+  const models = raw.split(",").map(parseModelSpec).filter(Boolean);
   return models.length > 0 ? models : [];
 }
 
@@ -76,10 +136,6 @@ const activeFamilySlots = {
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(",").map(o => o.trim())
   : null; // null means localhost-only (wildcard disabled by default)
-
-const upstreamUrl = new URL(OPENCODE_API_URL);
-const UPSTREAM_BASE = upstreamUrl.pathname.replace(/\/$/, "");
-const UPSTREAM_CLIENT = upstreamUrl.protocol === "http:" ? http : https;
 
 const LOCAL_MODELS = [
   "glm-5.1",
@@ -126,14 +182,12 @@ function selectFamilySlot(family, excludedSlots = new Set()) {
 }
 
 function reserveModel(model, excludedSlots = new Set()) {
-  if (model && model.startsWith("opencode-go/")) {
-    return { model: model.slice("opencode-go/".length), family: "direct", slot: null, release: () => {} };
-  }
-
   const family = modelFamily(model);
   if (!family) {
-    // Unknown model passed through as-is (e.g. a direct OpenCode Go model name)
-    return { model, family: "direct", slot: null, release: () => {} };
+    // Unknown model passed through as-is using either an explicit provider prefix
+    // (openrouter:model, openrouter/model, opencode/model) or DEFAULT_PROVIDER.
+    const spec = parseModelSpec(model);
+    return { ...spec, family: "direct", slot: null, release: () => {} };
   }
 
   const slot = selectFamilySlot(family, excludedSlots);
@@ -143,7 +197,7 @@ function reserveModel(model, excludedSlots = new Set()) {
   let released = false;
 
   return {
-    model: FAMILY_MODEL_POOLS[family][slot],
+    ...FAMILY_MODEL_POOLS[family][slot],
     family,
     slot,
     release: () => {
@@ -163,14 +217,24 @@ function shouldRetryWithFallback(statusCode, modelLease, triedSlots) {
   );
 }
 
-function extractApiKey(req) {
+function extractRequestApiKey(req) {
   const xApiKey = req.headers["x-api-key"];
   if (typeof xApiKey === "string" && xApiKey.trim()) return xApiKey.trim();
 
   const auth = req.headers.authorization || "";
   if (auth.startsWith("Bearer ")) return auth.slice(7).trim();
 
-  return OPENCODE_API_KEY;
+  return "";
+}
+
+function extractApiKey(req, providerName) {
+  const provider = PROVIDERS[providerName];
+  return provider?.apiKey || extractRequestApiKey(req);
+}
+
+function hasAnyApiKey(req) {
+  if (extractRequestApiKey(req)) return true;
+  return Object.values(PROVIDERS).some(provider => Boolean(provider.apiKey));
 }
 
 function readBody(req) {
@@ -194,25 +258,32 @@ function anthropicError(statusCode, message, type = "api_error") {
   };
 }
 
-function requestUpstream(method, apiPath, body, apiKey, handlers = {}) {
+function requestUpstream(providerName, method, apiPath, body, apiKey, handlers = {}) {
+  const provider = PROVIDERS[providerName];
+  if (!provider) {
+    if (handlers.onError) handlers.onError(new Error(`Unknown provider: ${providerName}`));
+    return null;
+  }
+
   const bodyStr = body === undefined ? "" : JSON.stringify(body);
   const headers = {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${apiKey}`,
+    ...provider.extraHeaders,
   };
   if (bodyStr) headers["Content-Length"] = Buffer.byteLength(bodyStr);
 
   const options = {
-    protocol: upstreamUrl.protocol,
-    hostname: upstreamUrl.hostname,
-    port: upstreamUrl.port || undefined,
-    path: `${UPSTREAM_BASE}${apiPath}`,
+    protocol: provider.url.protocol,
+    hostname: provider.url.hostname,
+    port: provider.url.port || undefined,
+    path: `${provider.basePath}${apiPath}`,
     method,
     headers,
     timeout: REQUEST_TIMEOUT_MS,
   };
 
-  const upstreamReq = UPSTREAM_CLIENT.request(options, upstreamRes => {
+  const upstreamReq = provider.client.request(options, upstreamRes => {
     let raw = "";
     upstreamRes.on("data", chunk => {
       raw += chunk.toString("utf8");
@@ -698,40 +769,30 @@ function closeOpenBlocks(res, state) {
   }
 }
 
-function proxyModels(req, res, apiKey) {
-  requestUpstream("GET", "/models", undefined, apiKey, {
-    onEnd: (raw, statusCode) => {
-      if (statusCode >= 200 && statusCode < 300) {
-        res.writeHead(statusCode, { "Content-Type": "application/json" });
-        res.end(raw);
-        return;
-      }
+function configuredModelIds() {
+  const configured = [
+    ...OPUS_MODELS,
+    ...SONNET_MODELS,
+    ...HAIKU_MODELS,
+  ].map(formatModelSpec);
 
-      jsonResponse(res, 200, {
-        object: "list",
-        data: LOCAL_MODELS.map(id => ({
-          id,
-          type: "model",
-          display_name: id,
-          created_at: "2026-05-12T00:00:00Z",
-        })),
-      });
-    },
-    onError: () => {
-      jsonResponse(res, 200, {
-        object: "list",
-        data: LOCAL_MODELS.map(id => ({
-          id,
-          type: "model",
-          display_name: id,
-          created_at: "2026-05-12T00:00:00Z",
-        })),
-      });
-    },
+  const defaults = LOCAL_MODELS.map(model => `${DEFAULT_PROVIDER}/${model}`);
+  return Array.from(new Set([...configured, ...defaults])).filter(Boolean);
+}
+
+function proxyModels(req, res) {
+  jsonResponse(res, 200, {
+    object: "list",
+    data: configuredModelIds().map(id => ({
+      id,
+      type: "model",
+      display_name: id,
+      created_at: "2026-05-12T00:00:00Z",
+    })),
   });
 }
 
-function handleMessages(req, res, body, apiKey) {
+function handleMessages(req, res, body) {
   const requestedModel = body.model || "(default sonnet)";
   const streaming = body.stream === true;
   const triedSlots = new Set();
@@ -750,7 +811,7 @@ function handleMessages(req, res, body, apiKey) {
     return modelLease;
   };
   const logAttempt = modelLease => {
-    console.log(`[${new Date().toISOString()}] ${requestedModel} -> ${modelLease.model} (stream: ${streaming}, pool: ${modelLease.family}${modelLease.slot === null ? "" : `#${modelLease.slot + 1}`})`);
+    console.log(`[${new Date().toISOString()}] ${requestedModel} -> ${formatModelSpec(modelLease)} (stream: ${streaming}, pool: ${modelLease.family}${modelLease.slot === null ? "" : `#${modelLease.slot + 1}`})`);
   };
 
   res.on("close", releaseCurrentModel);
@@ -782,12 +843,19 @@ function handleMessages(req, res, body, apiKey) {
         return;
       }
 
+      const apiKey = extractApiKey(req, modelLease.provider);
+      if (!apiKey) {
+        writeSse(res, "error", anthropicError(401, `Missing API key for provider: ${modelLease.provider}`, "authentication_error"));
+        res.end();
+        return;
+      }
+
       const openaiBody = convertAnthropicRequestToOpenAI(body, modelLease.model);
       let buffer = "";
       let errorRaw = "";
       logAttempt(modelLease);
 
-      requestUpstream("POST", "/chat/completions", openaiBody, apiKey, {
+      requestUpstream(modelLease.provider, "POST", "/chat/completions", openaiBody, apiKey, {
         onData: (chunk, statusCode) => {
           if (statusCode < 200 || statusCode >= 300) {
             errorRaw += chunk.toString("utf8");
@@ -808,7 +876,7 @@ function handleMessages(req, res, body, apiKey) {
             const errorBody = errorRaw || raw || "Upstream API error";
             console.error(`[upstream ${statusCode}] ${errorBody}`);
             if (shouldRetryWithFallback(statusCode, modelLease, triedSlots)) {
-              console.warn(`[fallback] ${modelLease.model} returned ${statusCode}; trying next ${modelLease.family} model`);
+              console.warn(`[fallback] ${formatModelSpec(modelLease)} returned ${statusCode}; trying next ${modelLease.family} model`);
               startStreamingAttempt();
               return;
             }
@@ -851,10 +919,16 @@ function handleMessages(req, res, body, apiKey) {
       return;
     }
 
+    const apiKey = extractApiKey(req, modelLease.provider);
+    if (!apiKey) {
+      jsonResponse(res, 401, anthropicError(401, `Missing API key for provider: ${modelLease.provider}`, "authentication_error"));
+      return;
+    }
+
     const openaiBody = convertAnthropicRequestToOpenAI(body, modelLease.model);
     logAttempt(modelLease);
 
-    requestUpstream("POST", "/chat/completions", openaiBody, apiKey, {
+    requestUpstream(modelLease.provider, "POST", "/chat/completions", openaiBody, apiKey, {
       onEnd: (raw, statusCode) => {
         releaseCurrentModel();
         let data;
@@ -868,13 +942,13 @@ function handleMessages(req, res, body, apiKey) {
         if (statusCode < 200 || statusCode >= 300) {
           console.error(`[upstream ${statusCode}] ${raw}`);
           if (shouldRetryWithFallback(statusCode, modelLease, triedSlots)) {
-            console.warn(`[fallback] ${modelLease.model} returned ${statusCode}; trying next ${modelLease.family} model`);
+            console.warn(`[fallback] ${formatModelSpec(modelLease)} returned ${statusCode}; trying next ${modelLease.family} model`);
             startNonStreamingAttempt();
             return;
           }
           jsonResponse(res, statusCode, anthropicError(
             statusCode,
-            data.error?.message || "OpenCode Go API error",
+            data.error?.message || `${modelLease.provider} API error`,
             data.error?.type || "api_error",
           ));
           return;
@@ -955,25 +1029,25 @@ const server = http.createServer(async (req, res) => {
   if ((pathname === "/" || pathname === "/health") && req.method === "GET") {
     jsonResponse(res, 200, {
       status: "ok",
-      message: "Anthropic -> OpenCode Go proxy running",
-      upstream: OPENCODE_API_URL,
+      message: "Anthropic -> OpenAI-compatible proxy running",
+      default_provider: DEFAULT_PROVIDER,
+      providers: Object.fromEntries(providerNames().map(name => [name, PROVIDERS[name].url.toString().replace(/\/$/, "")])),
       models: {
-        opus: OPUS_MODELS,
-        sonnet: SONNET_MODELS,
-        haiku: HAIKU_MODELS,
+        opus: OPUS_MODELS.map(formatModelSpec),
+        sonnet: SONNET_MODELS.map(formatModelSpec),
+        haiku: HAIKU_MODELS.map(formatModelSpec),
       },
     });
     return;
   }
 
-  const apiKey = extractApiKey(req);
-  if (!apiKey && ["/v1/messages", "/v1/messages/count_tokens", "/v1/models"].includes(pathname)) {
+  if (!hasAnyApiKey(req) && ["/v1/messages", "/v1/messages/count_tokens", "/v1/models"].includes(pathname)) {
     jsonResponse(res, 401, anthropicError(401, "Missing API key", "authentication_error"));
     return;
   }
 
   if (pathname === "/v1/models" && req.method === "GET") {
-    proxyModels(req, res, apiKey);
+    proxyModels(req, res);
     return;
   }
 
@@ -1001,7 +1075,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    handleMessages(req, res, body, apiKey);
+    handleMessages(req, res, body);
     return;
   }
 
@@ -1010,20 +1084,21 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`
-Anthropic -> OpenCode Go Proxy
+Anthropic -> OpenAI-compatible Proxy
 Listening : http://localhost:${PORT}
 Endpoint  : /v1/messages
 Models    : /v1/models
-Upstream  : ${OPENCODE_API_URL}
-Opus      : ${OPUS_MODELS.join(", ")}
-Sonnet    : ${SONNET_MODELS.join(", ")}
-Haiku     : ${HAIKU_MODELS.join(", ")}
-API Key   : ${OPENCODE_API_KEY ? "set via env" : "expected from Claude Code x-api-key / Authorization header"}
+Providers : ${providerNames().map(name => `${name}=${PROVIDERS[name].url.toString().replace(/\/$/, "")}`).join(", ")}
+Default   : ${DEFAULT_PROVIDER}
+Opus      : ${OPUS_MODELS.map(formatModelSpec).join(", ")}
+Sonnet    : ${SONNET_MODELS.map(formatModelSpec).join(", ")}
+Haiku     : ${HAIKU_MODELS.map(formatModelSpec).join(", ")}
+API Key   : ${providerNames().map(name => `${name}:${PROVIDERS[name].apiKey ? "env" : "request"}`).join(", ")}
 CORS      : ${ALLOWED_ORIGINS ? ALLOWED_ORIGINS.join(", ") : "localhost only (set ALLOWED_ORIGINS=* to allow all)"}
 
 Claude Code example:
   export ANTHROPIC_BASE_URL="http://localhost:${PORT}"
-  export ANTHROPIC_API_KEY="<opencode-go-api-key>"
+  export ANTHROPIC_API_KEY="<provider-api-key>"
   export ANTHROPIC_MODEL="claude-sonnet-4-5"
   claude
 `);
